@@ -1,5 +1,14 @@
 import AppKit
+@preconcurrency import ApplicationServices
 import ClipboardManagerCore
+
+/// `kAXTrustedCheckOptionPrompt` is imported as a mutable global `var` of type
+/// `Unmanaged<CFString>`, which Swift 6 strict concurrency rejects from both main-actor and
+/// nonisolated contexts (`takeUnretainedValue()` is also unavailable inside `@MainActor`).
+/// The value is fixed for the process lifetime, so asserting that here is sound.
+private nonisolated(unsafe) let accessibilityPromptOptions: CFDictionary = [
+    kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+] as CFDictionary
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -8,9 +17,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var store: ClipboardStore?
     private var historyPanel: HistoryPanelController?
     private var settingsController: SettingsController?
-    private var globalMonitor: Any?
+    private var hotkeyTap: HotkeyTap?
     private var shortcut = ShortcutBinding.default
     private var didInitialize = false
+    private var accessibilityTrusted = false
+    private let autoPaster = AutoPaster()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard !didInitialize else { return }
@@ -24,6 +35,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         didInitialize = true
         shortcut = loadShortcut()
+        accessibilityTrusted = requestAccessibilityTrustIfNeeded()
+        let hotkeyTap = HotkeyTap(shortcut: shortcut)
+        self.hotkeyTap = hotkeyTap
+        // Installing the tap is also the honest test of the permission: an untrusted process
+        // gets a global monitor that silently delivers nothing, but a tap that refuses to exist.
+        accessibilityTrusted = hotkeyTap.install { [weak self] in self?.presentHistory() }
         let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ClipboardManager", isDirectory: true)
         NSLog("Clipboard Manager data path: %@", applicationSupport.path)
@@ -32,7 +49,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.store = store
             NSLog("Clipboard Manager local store ready")
             self.historyPanel = HistoryPanelController(store: store)
-            self.settingsController = SettingsController(store: store, getShortcut: { [weak self] in self?.shortcut ?? .default }, saveShortcut: { [weak self] value in self?.shortcut = value; self?.persistShortcut(value) })
+            self.settingsController = SettingsController(store: store, getShortcut: { [weak self] in self?.shortcut ?? .default }, saveShortcut: { [weak self] value in
+                self?.shortcut = value
+                self?.hotkeyTap?.update(shortcut: value)
+                self?.persistShortcut(value)
+            })
             let monitor = MacClipboardMonitor { [weak self] payload in
                 do { _ = try self?.store?.insert(payload) }
                 catch { NSLog("Clipboard history write failed: %@", String(describing: error)) }
@@ -47,6 +68,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = "📋"
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Clipboard Manager 已运行", action: nil, keyEquivalent: ""))
+        if !accessibilityTrusted {
+            let warning = NSMenuItem(
+                title: "⚠️ 需授予辅助功能权限，\(shortcut.displayName) 才生效",
+                action: #selector(openAccessibilitySettings),
+                keyEquivalent: ""
+            )
+            warning.target = self
+            menu.addItem(warning)
+            menu.addItem(.separator())
+        }
         let showItem = NSMenuItem(title: "显示历史  \(shortcut.displayName)", action: #selector(showHistory), keyEquivalent: "v")
         showItem.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(showItem)
@@ -54,10 +85,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard self?.shortcut.matches(event) == true else { return }
-            Task { @MainActor in self?.historyPanel?.toggle() }
-        }
+        NSLog("Clipboard Manager accessibility trusted: %d", accessibilityTrusted ? 1 : 0)
+    }
+
+    /// Global key monitoring delivers nothing to an untrusted process, and macOS reports no
+    /// error when that happens. Ask for the grant explicitly, and let the caller surface the
+    /// state, so a missing permission shows up instead of silently disabling the shortcut.
+    private func requestAccessibilityTrustIfNeeded() -> Bool {
+        if AXIsProcessTrusted() { return true }
+        _ = AXIsProcessTrustedWithOptions(accessibilityPromptOptions)
+        return AXIsProcessTrusted()
+    }
+
+    @objc private func openAccessibilitySettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     @objc private func quit() {
@@ -65,7 +107,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showHistory() {
-        historyPanel?.toggle()
+        presentHistory()
+    }
+
+    /// Shows the history menu, then writes the chosen entry to the pasteboard and pastes it
+    /// back into whichever app was frontmost when the shortcut fired. The target app is
+    /// captured before the menu opens, because showing the menu changes the frontmost app.
+    private func presentHistory() {
+        guard !autoPaster.isPasting else { return }
+        let target = NSWorkspace.shared.frontmostApplication
+        guard let record = historyPanel?.show() else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        switch record.payload {
+        case .text(let text): pasteboard.setString(text, forType: .string)
+        case .image(let data): pasteboard.setData(data, forType: .png)
+        }
+        // Reusing an entry promotes the row that already holds it rather than adding a second
+        // copy. `markHandled` must follow the write before the monitor's next poll; both run on
+        // the main actor, so nothing can interleave between them.
+        try? store?.promote(id: record.id)
+        monitor?.markHandled(record.payload)
+        if let target { autoPaster.paste(into: target) }
     }
 
     @objc private func showSettings() { settingsController?.show() }
@@ -81,7 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         monitor?.stop()
-        if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
+        hotkeyTap?.remove()
     }
 }
 

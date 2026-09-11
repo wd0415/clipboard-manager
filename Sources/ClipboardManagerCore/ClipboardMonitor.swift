@@ -22,6 +22,13 @@ public final class ClipNormalizer: @unchecked Sendable {
         case .image(let data): return .image(data)
         }
     }
+
+    public static func raw(from payload: ClipPayload) -> RawClipboard {
+        switch payload {
+        case .text(let value): return .text(value)
+        case .image(let data): return .image(data)
+        }
+    }
 }
 
 #if os(macOS)
@@ -62,6 +69,13 @@ public final class MacClipboardMonitor {
     /// Performs one immediate read. Useful for deterministic tests and for a first read on launch.
     public func pollNow() {
         poll()
+    }
+
+    /// Records `payload` as already seen, so the pasteboard write the caller just made is not
+    /// captured as a fresh entry. Without it, reusing an old entry stores a second copy of
+    /// content that is already in the history.
+    public func markHandled(_ payload: ClipPayload) {
+        _ = normalizer.accept(ClipNormalizer.raw(from: payload))
     }
 
     private func poll() {

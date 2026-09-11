@@ -27,7 +27,16 @@ struct ShortcutBinding: Codable, Equatable {
     }
 
     func matches(_ event: NSEvent) -> Bool {
-        event.keyCode == keyCode && event.modifierFlags.intersection([.command, .option, .control, .shift]).rawValue == modifiers
+        matches(
+            keyCode: event.keyCode,
+            modifiers: event.modifierFlags.intersection([.command, .option, .control, .shift]).rawValue
+        )
+    }
+
+    /// The same test against the raw values a `CGEvent` carries, so the hotkey can be matched
+    /// inside an event tap without manufacturing an `NSEvent`.
+    func matches(keyCode pressedKeyCode: UInt16, modifiers pressedModifiers: UInt) -> Bool {
+        pressedKeyCode == keyCode && pressedModifiers == modifiers
     }
 }
 

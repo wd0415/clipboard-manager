@@ -44,3 +44,15 @@ import Testing
     let reopened = try ClipboardStore(directory: store.directory)
     #expect(reopened.list().last?.payload == .image(image))
 }
+
+@Test func promoteMovesAnExistingEntryToTheTopWithoutCopyingIt() throws {
+    let store = try ClipboardStore.temporary()
+    let older = try store.insert(.text("older"))
+    let newer = try store.insert(.text("newer"))
+
+    try store.promote(id: older.id)
+
+    #expect(store.list().map(\.id) == [older.id, newer.id])
+    // The row moves; it is not duplicated.
+    #expect(store.list().count == 2)
+}
