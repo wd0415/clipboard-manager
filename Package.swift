@@ -11,12 +11,17 @@ let package = Package(
             name: "ClipboardManagerCore",
             targets: ["ClipboardManagerCore"]
         ),
+        .executable(name: "ClipboardManagerApp", targets: ["ClipboardManagerApp"]),
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
             name: "ClipboardManagerCore"
+        ),
+        .executableTarget(
+            name: "ClipboardManagerApp",
+            dependencies: ["ClipboardManagerCore"]
         ),
         .testTarget(
             name: "ClipboardManagerCoreTests",
