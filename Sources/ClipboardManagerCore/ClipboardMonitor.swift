@@ -59,6 +59,11 @@ public final class MacClipboardMonitor {
         timer = nil
     }
 
+    /// Performs one immediate read. Useful for deterministic tests and for a first read on launch.
+    public func pollNow() {
+        poll()
+    }
+
     private func poll() {
         guard pasteboard.changeCount != lastChangeCount else { return }
         lastChangeCount = pasteboard.changeCount
