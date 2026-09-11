@@ -77,6 +77,10 @@ final class SettingsController: NSObject {
     func show() {
         if let window { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 250), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        // Programmatic windows default this to true, which makes `close()` release the window
+        // once more than ARC expects and leaves `self.window` dangling. The second `show()` then
+        // retains a dead object and crashes, so the extra release has to be turned off.
+        window.isReleasedWhenClosed = false
         window.title = "Clipboard Manager 设置"
         window.center()
         let content = NSView(frame: window.contentRect(forFrameRect: window.frame))

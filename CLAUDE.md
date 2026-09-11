@@ -80,7 +80,9 @@ the main actor.
 ### UI layer
 
 Controllers are `@MainActor` and build their UI entirely in code. Settings is a plain `NSWindow`
-laid out with `NSStackView` + `NSLayoutConstraint.activate`.
+laid out with `NSLayoutConstraint.activate`, and it sets `isReleasedWhenClosed = false` — the
+programmatic default of `true` makes `close()` release the window once more than ARC expects, so
+the next `show()` retains freed memory and crashes.
 
 The clipboard history is a **native `NSMenu`** popped at the cursor (`HistoryPanelController`),
 not a custom window. That is what supplies the translucent material, rounded corners, row
