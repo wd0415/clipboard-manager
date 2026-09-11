@@ -82,6 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showItem.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(showItem)
         menu.addItem(NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ","))
+        menu.addItem(NSMenuItem(title: "清空历史", action: #selector(clearHistory), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
@@ -106,17 +107,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
+    /// "显示历史" shows the whole history in one scrolling menu, unlike the ⌘⇧V pop-up, which is
+    /// paged to stay under its height cap.
     @objc private func showHistory() {
-        presentHistory()
+        presentHistory(mode: .scrolling)
     }
 
     /// Shows the history menu, then writes the chosen entry to the pasteboard and pastes it
     /// back into whichever app was frontmost when the shortcut fired. The target app is
     /// captured before the menu opens, because showing the menu changes the frontmost app.
-    private func presentHistory() {
+    private func presentHistory(mode: HistoryPanelController.Mode = .paged) {
         guard !autoPaster.isPasting else { return }
         let target = NSWorkspace.shared.frontmostApplication
-        guard let record = historyPanel?.show() else { return }
+        guard let record = historyPanel?.show(mode) else { return }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         switch record.payload {
@@ -132,6 +135,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showSettings() { settingsController?.show() }
+
+    /// Empties the history, after asking.
+    ///
+    /// "取消" is added first on purpose: `NSAlert` makes the first button the default, and having
+    /// Return trigger the destructive choice would make a stray keypress wipe everything.
+    ///
+    /// The dedup memory is reset alongside the store, because the pasteboard still holds the last
+    /// copied value — without the reset, re-copying it right after a clear would be dropped as
+    /// already seen and the app would look broken.
+    @objc private func clearHistory() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "清空剪贴板历史？"
+        alert.informativeText = "所有已保存的记录都会被删除，此操作无法撤销。"
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "清空")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        do {
+            try store?.clear()
+            monitor?.resetDeduplication()
+        } catch {
+            NSLog("Clipboard history clear failed: %@", String(describing: error))
+        }
+    }
 
     private func loadShortcut() -> ShortcutBinding {
         guard let data = UserDefaults.standard.data(forKey: "historyShortcut"), let value = try? JSONDecoder().decode(ShortcutBinding.self, from: data) else { return .default }

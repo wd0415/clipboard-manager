@@ -62,3 +62,21 @@ private func copy(_ value: String, to pasteboard: NSPasteboard, then monitor: Ma
 
     #expect(captured == [.text("reused"), .text("other")])
 }
+
+/// Why `clearHistory` resets dedup alongside the store: the pasteboard still holds the last
+/// copied value, so without the reset the very next copy of it would be dropped as unchanged and
+/// the app would look broken right after being emptied.
+@MainActor
+@Test func resetDeduplicationLetsTheSameValueBeCapturedAgain() {
+    var captured: [ClipPayload] = []
+    let (monitor, pasteboard) = makeMonitor { captured.append($0) }
+
+    copy("reused", to: pasteboard, then: monitor)
+    copy("reused", to: pasteboard, then: monitor)
+    #expect(captured == [.text("reused")])
+
+    monitor.resetDeduplication()
+    copy("reused", to: pasteboard, then: monitor)
+
+    #expect(captured == [.text("reused"), .text("reused")])
+}

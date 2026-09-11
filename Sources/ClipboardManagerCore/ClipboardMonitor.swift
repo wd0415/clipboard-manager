@@ -16,6 +16,13 @@ public final class ClipNormalizer: @unchecked Sendable {
         return true
     }
 
+    /// Forgets the last accepted value. Required whenever the history is emptied: the pasteboard
+    /// still holds whatever was copied last, so re-copying that same value would otherwise be
+    /// treated as already seen and silently skipped.
+    public func reset() {
+        last = nil
+    }
+
     public static func payload(from raw: RawClipboard) -> ClipPayload {
         switch raw {
         case .text(let value): return .text(value)
@@ -76,6 +83,12 @@ public final class MacClipboardMonitor {
     /// content that is already in the history.
     public func markHandled(_ payload: ClipPayload) {
         _ = normalizer.accept(ClipNormalizer.raw(from: payload))
+    }
+
+    /// Forgets the last captured value, so the next copy is stored even if it duplicates what is
+    /// already on the pasteboard. Call this whenever the history is emptied.
+    public func resetDeduplication() {
+        normalizer.reset()
     }
 
     private func poll() {

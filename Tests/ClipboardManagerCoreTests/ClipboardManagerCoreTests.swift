@@ -56,3 +56,26 @@ import Testing
     // The row moves; it is not duplicated.
     #expect(store.list().count == 2)
 }
+
+@Test func deleteRemovesOnlyTheNamedEntry() throws {
+    let store = try ClipboardStore.temporary()
+    let first = try store.insert(.text("first"))
+    let second = try store.insert(.text("second"))
+
+    try store.delete(id: first.id)
+
+    #expect(store.list().map(\.id) == [second.id])
+}
+
+@Test func clearRemovesEveryEntry() throws {
+    let store = try ClipboardStore.temporary()
+    _ = try store.insert(.text("one"))
+    _ = try store.insert(.image(Data([1, 2, 3])))
+
+    try store.clear()
+
+    #expect(store.list().isEmpty)
+    // The table survives, so the store is still usable afterwards.
+    _ = try store.insert(.text("after"))
+    #expect(store.list().map(\.displayText) == ["after"])
+}

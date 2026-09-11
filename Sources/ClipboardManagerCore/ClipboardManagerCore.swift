@@ -125,6 +125,23 @@ public final class ClipboardStore: @unchecked Sendable {
         guard sqlite3_step(statement) == SQLITE_DONE else { throw StoreError.database(Self.message(database)) }
     }
 
+    /// Removes one entry.
+    ///
+    /// Unlike `clear()` this is not confirmed: it is reached from the delete button on a single
+    /// row, where the click itself is the intent and the blast radius is one row.
+    public func delete(id: UUID) throws {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try prepare("DELETE FROM clips WHERE id = ?", &statement)
+        sqlite3_bind_text(statement, 1, id.uuidString, -1, sqliteTransient)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw StoreError.database(Self.message(database)) }
+    }
+
+    /// Removes every stored entry. Irreversible, so callers confirm before reaching here.
+    public func clear() throws {
+        try execute("DELETE FROM clips")
+    }
+
     public func list(query: String? = nil) -> [ClipRecord] {
         let sql = query?.isEmpty == false
             ? "SELECT id, created_at, kind, payload FROM clips WHERE kind = 0 AND lower(CAST(payload AS TEXT)) LIKE lower(?) ORDER BY created_at DESC"

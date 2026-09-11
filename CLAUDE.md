@@ -56,6 +56,10 @@ clips (id TEXT PRIMARY KEY, created_at REAL, kind INTEGER, payload BLOB)
 
 `maxEntries` (default 500) is enforced by calling `trim()` at the end of every `insert`, which deletes all but the newest N rows. It is not a background job.
 
+Row ids are written as `UUID.uuidString`, which is uppercase, and `promote(id:)` / `delete(id:)`
+match on it with `=`. SQLite compares TEXT case-sensitively, so a lowercase id — say, one inserted
+by hand while fixture-building — silently matches nothing and the delete appears to do nothing.
+
 `ClipboardStore` is a `@unchecked Sendable` class wrapping a non-thread-safe `sqlite3` handle. In practice it is only ever touched from the main actor, so the annotation is an assertion about call sites, not a guarantee — keep it that way rather than moving store access to a background queue.
 
 Search (`list(query:)`) casts the payload blob to text and does a `LIKE` match, and filters to `kind = 0`, so **images are never returned by a text query**.
@@ -77,6 +81,13 @@ history already holds — `recopyingWithoutMarkingItCapturesADuplicate` pins dow
 before the monitor's next poll; they are safe because `presentHistory` and the monitor both run on
 the main actor.
 
+"清空历史" (`AppDelegate.clearHistory`) empties the store and resets the normalizer in the same
+step. The reset is not optional: the pasteboard still holds the last copied value, so without it
+re-copying that value right after a clear would be dismissed as already seen and the app would look
+broken. `resetDeduplicationLetsTheSameValueBeCapturedAgain` pins that down. The confirmation alert
+puts "取消" first because `NSAlert` makes the first button the default and Return should not wipe
+the history.
+
 ### UI layer
 
 Controllers are `@MainActor` and build their UI entirely in code. Settings is a plain `NSWindow`
@@ -86,14 +97,35 @@ the next `show()` retains freed memory and crashes.
 
 The clipboard history is a **native `NSMenu`** popped at the cursor (`HistoryPanelController`),
 not a custom window. That is what supplies the translucent material, rounded corners, row
-highlight, single-line truncation and arrow-key navigation for free. Five consequences to know
-before changing it:
+highlight and arrow-key navigation for free. `NSMenu.highlightedItem` is read-only, and
+`popUp(positioning:at:in:)` with the first item as the positioning item does open with that row
+highlighted — which is what gives arrow-key navigation a starting point and reveals its delete
+button immediately.
 
-- `NSMenu.highlightedItem` is read-only, and passing a `positioningItem` to `popUp(positioning:at:in:)`
-  does **not** make it the initial selection (verified empirically — the docs and common advice
-  suggest otherwise). The menu therefore opens with no guaranteed highlighted row; a row is only
-  highlighted when the pointer happens to rest on it. Arrow keys are the reliable way to select.
-- Menu items render images at icon size, so image entries show an 18pt thumbnail, not a preview.
+Rows are `HistoryRowView`, a custom `NSMenuItem.view`, because a per-row delete button cannot be
+expressed with a plain item. Hosting a view costs two behaviours, and both are deliberate:
+
+- The menu stops performing click-to-select for that row. `HistoryRowView.mouseDown` selects
+  explicitly; without it a click on the row does nothing. Clicks landing on the delete button go
+  to the button and never reach `mouseDown`, so no explicit hit test is needed.
+- The reveal cannot use `NSTrackingArea`. Measured against a live menu, a tracking area fires only
+  when the pointer crosses into it *during* a move and misses when the pointer arrives directly, so
+  the button would show up only sometimes. `menu(_:willHighlight:)` is reliable and fires for
+  arrow-key selection as well, which is exactly the "hovered or selected" behaviour wanted.
+
+Menus can be mutated while they are tracking: removing and re-adding items leaves the menu open
+and it re-lays out its rows. That is what lets paging and deletion redraw in place instead of
+closing and reopening the menu under the pointer.
+
+The two entry points present the same records differently. ⌘⇧V is **paged** — 11 entries plus a
+footer that carries ‹ › and a page indicator, capped at 3 pages so a long history cannot become an
+endless pager. "显示历史" in the status menu is **scrolling**: every entry in one menu, with the
+native scrolling that implies. Entries past the last page are therefore reachable only through the
+latter. `HistoryPanelController.Mode` picks between them; `presentHistory(mode:)` defaults to
+paged, and only `showHistory` passes `.scrolling`.
+
+Three further consequences of building this out of a menu:
+
 - `popUp` runs a nested event loop and returns only once the menu has closed. The selection is
   read *after* it returns, so the synthesized ⌘V is never delivered to the still-tracking menu.
 - `AutoPaster` polls `NSRunningApplication.isActive` rather than sleeping a fixed interval, and
@@ -101,12 +133,13 @@ before changing it:
   pasting early sends the keystroke nowhere. Its `isPasting` flag keeps `presentHistory` from
   starting a second paste while one is in flight.
 - The menu has no maximum width or height — `minimumWidth` is a floor, not a ceiling — so
-  `HistoryPanelController` holds it to 260×300pt from the content side: titles are truncated by
-  binary search over grapheme clusters against a budget measured in **points** (the history mixes
-  Chinese and Latin, so a character count would be wrong for both), and only
-  `maxMenuHeight / menuRowHeight` entries are handed to the menu at all. `menuHorizontalChrome`
-  was measured rather than estimated — a 200pt title budget rendered a 229pt menu, so the chrome
-  is ~30pt. Re-measure after touching any of these constants.
+  `HistoryPanelController` holds it to 260×300pt from the content side: a row view `w` points wide
+  renders a menu exactly `w` wide (measured, so there is no added horizontal chrome), and a menu
+  spends ~12pt vertically on padding, which makes 12 rows of 24pt land on 300pt. Titles are
+  truncated by binary search over grapheme clusters against a budget measured in **points** — the
+  history mixes Chinese and Latin, so a character count would be wrong for both — and the budget
+  comes from `HistoryRowView.titleWidth`, which is what remains once the thumbnail and the delete
+  button are placed. Re-measure after touching any of these.
 
 `ShortcutBinding` lives in `SettingsController.swift`, not its own file. The global shortcut is
 claimed by a `CGEvent` tap (`HotkeyTap`), **not** `NSEvent.addGlobalMonitorForEvents`: a global
