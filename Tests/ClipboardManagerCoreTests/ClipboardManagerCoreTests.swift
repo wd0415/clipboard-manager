@@ -31,3 +31,16 @@ import Testing
 
     #expect(store.list().map(\.displayText) == ["three", "two"])
 }
+
+@Test func persistsImagePayloadAndFiltersText() throws {
+    let store = try ClipboardStore.temporary()
+    let image = Data([0, 1, 2, 3])
+    _ = try store.insert(.image(image))
+    _ = try store.insert(.text("Swift clipboard"))
+
+    #expect(store.list(query: "swift").map(\.displayText) == ["Swift clipboard"])
+    #expect(store.list().first?.payload == .text("Swift clipboard"))
+
+    let reopened = try ClipboardStore(directory: store.directory)
+    #expect(reopened.list().last?.payload == .image(image))
+}

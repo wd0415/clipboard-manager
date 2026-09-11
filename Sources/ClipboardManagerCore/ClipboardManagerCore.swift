@@ -1,4 +1,7 @@
 import Foundation
+import SQLite3
+
+private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 public enum ClipPayload: Codable, Equatable, Sendable {
     case text(String)
@@ -48,24 +51,38 @@ public struct ClipRecord: Codable, Equatable, Identifiable, Sendable {
 }
 
 public final class ClipboardStore: @unchecked Sendable {
-    private struct Snapshot: Codable { var records: [ClipRecord] }
-
-    private let fileURL: URL
+    public let directory: URL
+    private let databaseURL: URL
+    private var database: OpaquePointer?
     private(set) public var maxEntries: Int
-    private var records: [ClipRecord]
 
     public init(directory: URL, maxEntries: Int = 500) throws {
         guard maxEntries > 0 else { throw StoreError.invalidLimit }
         self.maxEntries = maxEntries
-        self.fileURL = directory.appendingPathComponent("history.json")
+        self.directory = directory
+        self.databaseURL = directory.appendingPathComponent("history.sqlite3")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        if let data = try? Data(contentsOf: fileURL) {
-            self.records = try JSONDecoder().decode(Snapshot.self, from: data).records
-        } else {
-            self.records = []
+        guard sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
+            throw StoreError.database(Self.message(database))
         }
-        self.records.sort { $0.createdAt > $1.createdAt }
+        do {
+            try execute("""
+                CREATE TABLE IF NOT EXISTS clips (
+                    id TEXT PRIMARY KEY,
+                    created_at REAL NOT NULL,
+                    kind INTEGER NOT NULL,
+                    payload BLOB NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS clips_created_at ON clips(created_at DESC);
+                """)
+        } catch {
+            sqlite3_close(database)
+            database = nil
+            throw error
+        }
     }
+
+    deinit { sqlite3_close(database) }
 
     public static func temporary(maxEntries: Int = 500) throws -> ClipboardStore {
         let directory = FileManager.default.temporaryDirectory
@@ -76,27 +93,84 @@ public final class ClipboardStore: @unchecked Sendable {
     @discardableResult
     public func insert(_ payload: ClipPayload) throws -> ClipRecord {
         let record = ClipRecord(payload: payload)
-        records.insert(record, at: 0)
-        records = Array(records.prefix(maxEntries))
-        try persist()
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try prepare("INSERT INTO clips (id, created_at, kind, payload) VALUES (?, ?, ?, ?)", &statement)
+        sqlite3_bind_text(statement, 1, record.id.uuidString, -1, sqliteTransient)
+        sqlite3_bind_double(statement, 2, record.createdAt.timeIntervalSince1970)
+        switch payload {
+        case .text(let value):
+            sqlite3_bind_int(statement, 3, 0)
+            let data = Data(value.utf8)
+            _ = data.withUnsafeBytes { sqlite3_bind_blob(statement, 4, $0.baseAddress, Int32(data.count), sqliteTransient) }
+        case .image(let data):
+            sqlite3_bind_int(statement, 3, 1)
+            _ = data.withUnsafeBytes { sqlite3_bind_blob(statement, 4, $0.baseAddress, Int32(data.count), sqliteTransient) }
+        }
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw StoreError.database(Self.message(database)) }
+        try trim()
         return record
     }
 
-    public func list() -> [ClipRecord] { records }
+    public func list(query: String? = nil) -> [ClipRecord] {
+        let sql = query?.isEmpty == false
+            ? "SELECT id, created_at, kind, payload FROM clips WHERE kind = 0 AND lower(CAST(payload AS TEXT)) LIKE lower(?) ORDER BY created_at DESC"
+            : "SELECT id, created_at, kind, payload FROM clips ORDER BY created_at DESC"
+        var statement: OpaquePointer?
+        guard (try? prepare(sql, &statement)) != nil else { return [] }
+        defer { sqlite3_finalize(statement) }
+        if let query, !query.isEmpty { sqlite3_bind_text(statement, 1, "%\(query)%", -1, sqliteTransient) }
+        var result: [ClipRecord] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let record = record(from: statement) else { continue }
+            result.append(record)
+        }
+        return result
+    }
 
     public func setMaxEntries(_ limit: Int) throws {
         guard limit > 0 else { throw StoreError.invalidLimit }
         maxEntries = limit
-        records = Array(records.prefix(limit))
-        try persist()
+        try trim()
     }
 
-    private func persist() throws {
-        let data = try JSONEncoder().encode(Snapshot(records: records))
-        try data.write(to: fileURL, options: .atomic)
+    private func trim() throws {
+        try execute("DELETE FROM clips WHERE id NOT IN (SELECT id FROM clips ORDER BY created_at DESC LIMIT \(maxEntries))")
+    }
+
+    private func execute(_ sql: String) throws {
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        guard sqlite3_exec(database, sql, nil, nil, &errorMessage) == SQLITE_OK else {
+            let message = errorMessage.map { String(cString: $0) } ?? Self.message(database)
+            sqlite3_free(errorMessage)
+            throw StoreError.database(message)
+        }
+    }
+
+    private func prepare(_ sql: String, _ statement: inout OpaquePointer?) throws {
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw StoreError.database(Self.message(database))
+        }
+    }
+
+    private func record(from statement: OpaquePointer?) -> ClipRecord? {
+        guard let idText = sqlite3_column_text(statement, 0), let id = UUID(uuidString: String(cString: idText)) else { return nil }
+        let date = Date(timeIntervalSince1970: sqlite3_column_double(statement, 1))
+        let kind = sqlite3_column_int(statement, 2)
+        let length = sqlite3_column_bytes(statement, 3)
+        guard let bytes = sqlite3_column_blob(statement, 3) else { return nil }
+        let data = Data(bytes: bytes, count: Int(length))
+        let payload: ClipPayload = kind == 0 ? .text(String(decoding: data, as: UTF8.self)) : .image(data)
+        return ClipRecord(id: id, createdAt: date, payload: payload)
+    }
+
+    private static func message(_ database: OpaquePointer?) -> String {
+        guard let database, let message = sqlite3_errmsg(database) else { return "Unknown SQLite error" }
+        return String(cString: message)
     }
 }
 
 public enum StoreError: Error, Equatable {
     case invalidLimit
+    case database(String)
 }
