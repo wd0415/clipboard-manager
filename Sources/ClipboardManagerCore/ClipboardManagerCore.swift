@@ -54,9 +54,12 @@ public final class ClipboardStore: @unchecked Sendable {
     public let directory: URL
     private let databaseURL: URL
     private var database: OpaquePointer?
-    private(set) public var maxEntries: Int
+    /// How many entries the store keeps. Fixed rather than adjustable: the history exists to make
+    /// the last few copies reachable, and a limit the user can raise only makes the list longer to
+    /// search by eye. Enforced by `trim()` at the end of every `insert`.
+    public let maxEntries: Int
 
-    public init(directory: URL, maxEntries: Int = 500) throws {
+    public init(directory: URL, maxEntries: Int = 50) throws {
         guard maxEntries > 0 else { throw StoreError.invalidLimit }
         self.maxEntries = maxEntries
         self.directory = directory
@@ -84,7 +87,7 @@ public final class ClipboardStore: @unchecked Sendable {
 
     deinit { sqlite3_close(database) }
 
-    public static func temporary(maxEntries: Int = 500) throws -> ClipboardStore {
+    public static func temporary(maxEntries: Int = 50) throws -> ClipboardStore {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("clipboard-manager-\(UUID().uuidString)", isDirectory: true)
         return try ClipboardStore(directory: directory, maxEntries: maxEntries)
@@ -156,12 +159,6 @@ public final class ClipboardStore: @unchecked Sendable {
             result.append(record)
         }
         return result
-    }
-
-    public func setMaxEntries(_ limit: Int) throws {
-        guard limit > 0 else { throw StoreError.invalidLimit }
-        maxEntries = limit
-        try trim()
     }
 
     private func trim() throws {

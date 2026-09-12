@@ -13,6 +13,7 @@ private nonisolated(unsafe) let accessibilityPromptOptions: CFDictionary = [
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
+    private var showHistoryItem: NSMenuItem?
     private var monitor: MacClipboardMonitor?
     private var store: ClipboardStore?
     private var historyPanel: HistoryPanelController?
@@ -56,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.shortcut = value
                 self?.hotkeyTap?.update(shortcut: value)
                 self?.persistShortcut(value)
+                self?.applyShortcutToStatusMenu()
             })
             let monitor = MacClipboardMonitor { [weak self] payload in
                 do { _ = try self?.store?.insert(payload) }
@@ -68,7 +70,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.title = "📋"
+        // A template symbol rather than an emoji: it takes its colour and optical weight from the
+        // menu bar and sits with the items around it, which a colour emoji at its own size does not.
+        let icon = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "Clipboard Manager")
+        icon?.isTemplate = true
+        statusItem.button?.image = icon
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Clipboard Manager 已运行", action: nil, keyEquivalent: ""))
         if !accessibilityTrusted {
@@ -81,9 +87,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(warning)
             menu.addItem(.separator())
         }
-        let showItem = NSMenuItem(title: "显示历史  \(shortcut.displayName)", action: #selector(showHistory), keyEquivalent: "v")
-        showItem.keyEquivalentModifierMask = [.command, .shift]
+        let showItem = NSMenuItem(title: "", action: #selector(showHistory), keyEquivalent: "")
         menu.addItem(showItem)
+        showHistoryItem = showItem
+        applyShortcutToStatusMenu()
         menu.addItem(NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "清空历史", action: #selector(clearHistory), keyEquivalent: ""))
         menu.addItem(.separator())
@@ -167,6 +174,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func loadShortcut() -> ShortcutBinding {
         guard let data = UserDefaults.standard.data(forKey: "historyShortcut"), let value = try? JSONDecoder().decode(ShortcutBinding.self, from: data) else { return .default }
         return value
+    }
+
+    /// Keeps the status menu's "显示历史" row in step with the binding.
+    ///
+    /// The row names the keys and also carries them as its key equivalent, so a rebind has to
+    /// rewrite both. Rebuilding only the menu's title would still leave it answering to the old
+    /// combination — the row would be wrong in what it says and in what it does.
+    private func applyShortcutToStatusMenu() {
+        guard let showHistoryItem else { return }
+        showHistoryItem.title = "显示历史  \(shortcut.displayName)"
+        showHistoryItem.keyEquivalent = shortcut.keyEquivalent
+        showHistoryItem.keyEquivalentModifierMask = shortcut.modifierFlags
     }
 
     private func persistShortcut(_ value: ShortcutBinding) {

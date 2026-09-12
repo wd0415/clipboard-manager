@@ -9,6 +9,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/.build/arm64-apple-macosx/release/ClipboardManagerApp" "$APP/Contents/MacOS/ClipboardManagerApp"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 chmod +x "$APP/Contents/MacOS/ClipboardManagerApp"
 
 # Sign with a certificate, not ad-hoc.

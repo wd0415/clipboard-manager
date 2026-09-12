@@ -159,6 +159,10 @@ final class HistoryRowView: NSView {
 ///
 /// It is a menu row like any other, but it deliberately does not override `mouseDown`: clicking
 /// the footer's background should do nothing rather than pick an entry.
+///
+/// It carries the keyboard legend as well as the ‹ › buttons. The buttons are the pointer's way
+/// to turn a page and the keys are the keyboard's, and nothing else in the menu says so — a menu
+/// has no room for a help line, and these four keys are the whole interaction.
 @MainActor
 final class HistoryFooterView: NSView {
     static let height: CGFloat = 24
@@ -186,11 +190,15 @@ final class HistoryFooterView: NSView {
         addSubview(nextButton)
 
         // Disabled at the ends rather than hidden, so the footer keeps its shape across pages.
+        // The tint is stepped down for the disabled end as well: at the same colour the two
+        // chevrons read alike, and the footer has to say which way the history can be turned.
         previousButton.isEnabled = page > 1
+        previousButton.contentTintColor = page > 1 ? .secondaryLabelColor : .tertiaryLabelColor
         nextButton.isEnabled = page < pageCount
+        nextButton.contentTintColor = page < pageCount ? .secondaryLabelColor : .tertiaryLabelColor
 
-        pageLabel.stringValue = "第 \(page)/\(pageCount) 页"
-        pageLabel.font = .menuFont(ofSize: 0)
+        pageLabel.stringValue = "第 \(page)/\(pageCount) 页 · ← → 翻页 · ↵ 粘贴"
+        pageLabel.font = .menuFont(ofSize: 11)
         pageLabel.textColor = .secondaryLabelColor
         pageLabel.alignment = .center
         pageLabel.frame = NSRect(
@@ -203,6 +211,14 @@ final class HistoryFooterView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// Marks where the entries end. Drawn here rather than added as a real `NSMenuItem.separator()`
+    /// because a separator is its own item with its own height, and the menu's height budget is
+    /// full at twelve rows — this costs nothing vertically. Insets match the rows' own padding.
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.separatorColor.setFill()
+        NSRect(x: Self.padding, y: bounds.height - 1, width: bounds.width - Self.padding * 2, height: 1).fill()
+    }
 
     private func configure(_ button: NSButton, symbol: String, action: Selector) {
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)

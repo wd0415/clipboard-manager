@@ -23,9 +23,17 @@ swift run --disable-sandbox ClipboardManagerApp   # run the menu bar app from so
 
 ./scripts/build-app.sh                         # build release + bundle dist/Clipboard Manager.app
 open "dist/Clipboard Manager.app"
+
+swift scripts/make-appicon.swift               # regenerate Resources/AppIcon.icns
 ```
 
 `build-app.sh` hardcodes the `.build/arm64-apple-macosx/release/` path, so it only works on Apple Silicon.
+
+`Resources/AppIcon.icns` is generated, and the generator is checked in so the icon has an editable
+source instead of being a binary nobody can change. It draws the clipboard from Bézier paths rather
+than borrowing an SF Symbol, because Apple's SF Symbols licence excludes app icons and logos. The
+bundle copies it and `Info.plist` names it in `CFBundleIconFile`; without both, the app and the dmg
+show the generic icon.
 
 The script signs with a certificate — `Apple Development: woden0415@gmail.com (T942J42MF7)` by
 default, overridable through `CODESIGN_IDENTITY`, and `-` to go back to ad-hoc. The certificate is
@@ -96,7 +104,11 @@ clips (id TEXT PRIMARY KEY, created_at REAL, kind INTEGER, payload BLOB)
 
 `kind` 0 = text, 1 = image. `payload` holds the raw bytes (UTF-8 for text, raw image data for images), not JSON — `ClipPayload`'s discriminator is re-encoded into the `kind` column rather than serialized. The default path is `~/Library/Application Support/ClipboardManager/history.sqlite3`; `ClipboardStore.temporary()` is the test factory.
 
-`maxEntries` (default 500) is enforced by calling `trim()` at the end of every `insert`, which deletes all but the newest N rows. It is not a background job.
+`maxEntries` is **fixed at 50** and is a `let`, with no setter and no UI — the history exists to
+make the last few copies reachable, and a limit the user can raise only makes the list longer to
+scan. It is enforced by calling `trim()` at the end of every `insert`, which deletes all but the
+newest N rows. It is not a background job, and nothing trims at launch: a store left over from a
+larger limit keeps its extra rows until the next copy, then falls to 50.
 
 Row ids are written as `UUID.uuidString`, which is uppercase, and `promote(id:)` / `delete(id:)`
 match on it with `=`. SQLite compares TEXT case-sensitively, so a lowercase id — say, one inserted
@@ -191,6 +203,25 @@ single list the menu's rows and `highlightedRow` are both derived from, so "the 
 painted" and "the row Return picks" cannot drift apart. Committing is `cancelTracking()` plus
 setting `pendingSelection`, the same two steps `mouseDown` takes.
 
+The footer marks where the entries end and doubles as the keyboard legend, and both are drawn
+rather than added as items. A real `NSMenuItem.separator()` is an item with a height of its own,
+and the layout budget is full at twelve rows, so the hairline is painted across the top of
+`HistoryFooterView` instead — inset like the rows — which costs nothing vertically. The legend
+rides in the page label (`第 1/3 页 · ← → 翻页 · ↵ 粘贴`): the page number alone would not say that
+the arrows and Return work at all, and a menu has nowhere else to put a help line. Measured, that
+string is 151pt at 11pt against the 204pt the footer has between its chevrons, so it fits as
+rendered — re-measure before adding to it. The chevrons step their tint with their enabled state
+(`secondaryLabelColor` / `tertiaryLabelColor`), because at one colour the two ends read alike and
+the footer has to say which way the history can still be turned.
+
+An empty history is two disabled rows — `还没有剪贴板历史` and an 11pt
+`复制任意文本或图片后会自动出现在这里`. A single bare line reads as a broken feature rather than an
+unused one.
+
+The status item is a template SF Symbol (`doc.on.clipboard`) rather than the emoji it used to be:
+a template image takes its colour and optical weight from the menu bar and sits with the items
+beside it, which a colour emoji at its own size does not.
+
 Note when verifying any of this: a synthetic key or mouse move cannot be driven into a tracking
 menu — measured, posted events never arrive, which is why the arrow-key path could not be checked
 by posting arrows. Drive `menu(_:willHighlight:)` directly instead; that is what AppKit's own
@@ -241,10 +272,31 @@ rather than the `CGEvent`, because `CGEvent` is not `Sendable` under strict conc
 reaches the instance through an **unretained** refcon — so the owner must outlive the tap and call
 `remove()`. It carries a second job: `onUnmodifiedKey` is consulted first for keys with no
 modifiers, which is how the history menu's paging arrows and its Return key are claimed (see the
-UI layer). The menu
-item's key equivalent is hardcoded to `⌘⇧V` and does not follow a rebound
-shortcut. Shortcut and history limit persist via `UserDefaults` (`historyShortcut` key) and the
-store respectively.
+UI layer).
+
+The status menu's "显示历史" row is rewritten from the binding on every save — title *and* key
+equivalent, not just the title. A row that named the new keys while still answering to the old
+combination would be wrong in what it says and in what it does, which is what it was before.
+
+Both halves of that row come from the keyboard layout, not a table. `ShortcutBinding.displayName`
+spells the key through `UCKeyTranslate` against the current input source, falling back to
+`namedKeys` for keys that carry no character (arrows, Return, F-keys) and to "按键" when the layout
+cannot say. `keyEquivalent` is the same lookup in lower case — `NSMenuItem` matches the character
+the key produces *without* Shift, and Shift travels in the modifier mask — and is empty for the
+named keys, because a menu cannot offer an arrow key as a key equivalent. The table this replaced
+knew five letters and called everything else "按键", so a shortcut rebound to anything but
+⌘⇧V/A/S/D/F advertised itself as `⌘按键`.
+
+The recorder is a **non-editable** `ShortcutRecorderField`: it records only while it is first
+responder, shows `请按下组合键…` then, and passes key equivalents through otherwise. An editable
+field would put a field editor in the responder chain and swallow every key equivalent in the
+window, ⌘Q included. Being non-editable costs three overrides — `acceptsFirstResponder`,
+`mouseDown` (AppKit does not focus a label-like field on a click) and Tab, which moves to
+`nextValidKeyView` rather than `selectNextKeyView(_:)`: the latter is a key-window action, so
+while the window is not key the field would keep recording and eat the next keystroke.
+
+The shortcut persists via `UserDefaults` (`historyShortcut` key). The history limit does not
+persist because it is no longer a setting.
 
 ## Conventions
 

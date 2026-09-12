@@ -6,6 +6,8 @@
 	<string>Clipboard Manager</string>
 	<key>CFBundleExecutable</key>
 	<string>ClipboardManagerApp</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.clipboardmanager.app</string>
 	<key>CFBundleName</key>

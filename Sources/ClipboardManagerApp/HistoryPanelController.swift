@@ -153,6 +153,18 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
             let empty = NSMenuItem(title: "还没有剪贴板历史", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
+            // Says what fills the list and when — an empty menu on its own reads as a broken
+            // feature rather than one that has not been used yet.
+            let guidance = NSMenuItem(title: "复制任意文本或图片后会自动出现在这里", action: nil, keyEquivalent: "")
+            guidance.isEnabled = false
+            guidance.attributedTitle = NSAttributedString(
+                string: guidance.title,
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: 11),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
+            )
+            menu.addItem(guidance)
             return
         }
 
