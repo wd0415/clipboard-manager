@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Start here
+
+**Read `todo.md` at the start of every session, before proposing or starting work.** It is the
+backlog: what is still outstanding, and for each entry the part of the current implementation it
+collides with. It is a list of what is *not* done, not a spec — nothing in it is decided, and a
+task that is not in it is new rather than covered by it. Keep it current: when an entry is
+finished, delete it there instead of leaving it to rot.
+
 ## Commands
 
 All SwiftPM commands need `--disable-sandbox`; SwiftPM's own sandboxing conflicts with the sandboxed shell used here.
