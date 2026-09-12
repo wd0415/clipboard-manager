@@ -19,6 +19,7 @@ final class HotkeyTap {
     private var runLoopSource: CFRunLoopSource?
     private var shortcut: ShortcutBinding
     private var onHotkey: (() -> Void)?
+    private var onUnmodifiedKey: ((UInt16) -> Bool)?
     private var lastFire = Date.distantPast
 
     init(shortcut: ShortcutBinding) {
@@ -32,12 +33,22 @@ final class HotkeyTap {
     /// Installs the tap. Returns false when it could not be created, which in practice means
     /// this process is not trusted for Accessibility.
     ///
+    /// `onUnmodifiedKey` is consulted for every key-down that carries no modifiers; returning
+    /// true means the tap consumed it, so nothing else — not the focused application, and not a
+    /// menu that is tracking — ever sees it. The history menu's keys are the reason it exists —
+    /// the paging arrows and Return, which picks the marked entry: a tracking menu runs its own
+    /// event loop over those, so this is the only vantage point ahead of it.
+    ///
     /// The tap holds an unretained reference to `self` as its refcon, so the caller must keep
     /// this object alive for as long as the tap is installed and call `remove()` on the way out.
     @discardableResult
-    func install(onHotkey: @escaping () -> Void) -> Bool {
+    func install(
+        onHotkey: @escaping () -> Void,
+        onUnmodifiedKey: @escaping (UInt16) -> Bool
+    ) -> Bool {
         guard tap == nil else { return true }
         self.onHotkey = onHotkey
+        self.onUnmodifiedKey = onUnmodifiedKey
         // Disabled-by-timeout and disabled-by-user-input only arrive if they are in the mask.
         let mask = CGEventMask(1) << CGEventType.keyDown.rawValue
             | CGEventMask(1) << CGEventType.tapDisabledByTimeout.rawValue
@@ -65,6 +76,7 @@ final class HotkeyTap {
         runLoopSource = nil
         tap = nil
         onHotkey = nil
+        onUnmodifiedKey = nil
     }
 
     /// Returns true when the event was the shortcut and must not reach any other application.
@@ -79,6 +91,9 @@ final class HotkeyTap {
         }
         guard type == .keyDown else { return false }
         let modifiers = Self.modifierRawValue(CGEventFlags(rawValue: flags))
+        // Unmodified keys first: the shortcut always carries modifiers, so the two never compete,
+        // and the history menu's keys must be claimed before the menu's event loop runs.
+        if modifiers == 0, onUnmodifiedKey?(keyCode) == true { return true }
         guard shortcut.matches(keyCode: keyCode, modifiers: modifiers) else { return false }
 
         let now = Date()

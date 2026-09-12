@@ -19,13 +19,47 @@ open "dist/Clipboard Manager.app"
 
 `build-app.sh` hardcodes the `.build/arm64-apple-macosx/release/` path, so it only works on Apple Silicon.
 
-The script signs ad-hoc (`codesign --force --sign -`). An ad-hoc signature carries no Team ID, so
-TCC falls back to matching the binary's cdhash — which changes on every rebuild. **Each rebuild
-silently invalidates the Accessibility grant.** System Settings keeps showing the toggle as ON,
-because that row belongs to the previous build, so the symptom is "the permission is granted but
-the shortcut does nothing". Fixing it means re-granting after a rebuild, or signing with a stable
-identity so the designated requirement outlives the build. Do not conclude the grant is fine from
-System Settings alone.
+The script signs with a certificate — `Apple Development: woden0415@gmail.com (T942J42MF7)` by
+default, overridable through `CODESIGN_IDENTITY`, and `-` to go back to ad-hoc. The certificate is
+what makes the grant survive a rebuild, so it is worth understanding why ad-hoc cannot.
+
+An ad-hoc signature carries no Team ID, which collapses the designated requirement to a bare
+cdhash:
+
+```
+# designated => cdhash H"17d331d3a3ecff88d9f972cbba0df784b710c605"
+```
+
+TCC stores that requirement when the grant is created and **never regenerates it** — flipping the
+switch in System Settings only writes the `auth_value` column. So an ad-hoc build loses the grant
+on every rebuild, and no amount of toggling brings it back; the row has to be deleted and re-added
+(or `tccutil reset Accessibility local.clipboardmanager.app`) so that a fresh requirement is
+derived from the binary that is actually installed. The symptom is "the permission is granted but
+the shortcut does nothing" — System Settings still shows that row as ON, because it belongs to the
+previous build. Do not conclude the grant is fine from System Settings alone.
+
+The request is logged, and it is the honest readout. A mismatch shows up as:
+
+```
+tccd  Failed to match existing code requirement for subject local.clipboardmanager.app
+      and service kTCCServiceAccessibility
+```
+
+```bash
+/usr/bin/log show --last 3m --predicate 'process == "tccd"' --style compact | grep -i clipboard
+```
+
+With the certificate the requirement is identity-based instead —
+
+```
+designated => identifier "local.clipboardmanager.app" and anchor apple generic and
+              certificate leaf[subject.CN] = "Apple Development: woden0415@gmail.com (T942J42MF7)" …
+```
+
+— which is the same string after every rebuild, so the grant is given once. `codesign -dvvv` tells
+the two apart: ad-hoc prints `Signature=adhoc` and `TeamIdentifier=not set`, the certificate
+prints `Authority=` lines and a Team ID. Because the requirement *shape* changes with the signing
+mode, switching between the two invalidates the existing grant one last time.
 
 Beware the related measurement trap: an app launched from a terminal **inherits the terminal's own
 Accessibility grant**, so an untrusted build reports `trusted: 1` and behaves as if permission were
@@ -96,14 +130,16 @@ programmatic default of `true` makes `close()` release the window once more than
 the next `show()` retains freed memory and crashes.
 
 The clipboard history is a **native `NSMenu`** popped at the cursor (`HistoryPanelController`),
-not a custom window. That is what supplies the translucent material, rounded corners, row
-highlight and arrow-key navigation for free. `NSMenu.highlightedItem` is read-only, and
-`popUp(positioning:at:in:)` with the first item as the positioning item does open with that row
-highlighted — which is what gives arrow-key navigation a starting point and reveals its delete
-button immediately.
+not a custom window. That is what supplies the translucent material, rounded corners and
+arrow-key navigation for free. `NSMenu.highlightedItem` is read-only, and
+`popUp(positioning:at:in:)` puts the positioning item's **top-left corner** on the point it is
+given — the menu rounds its origin to the pixel grid, so passing the pointer straight through
+leaves it in the padding strip just above the first row. `popUpAnchorOffset` hangs the menu half
+a row below and a margin in from the pointer instead, so that the pointer and the marked row agree
+from the first frame.
 
 Rows are `HistoryRowView`, a custom `NSMenuItem.view`, because a per-row delete button cannot be
-expressed with a plain item. Hosting a view costs two behaviours, and both are deliberate:
+expressed with a plain item. Hosting a view costs three behaviours, and all three are deliberate:
 
 - The menu stops performing click-to-select for that row. `HistoryRowView.mouseDown` selects
   explicitly; without it a click on the row does nothing. Clicks landing on the delete button go
@@ -112,10 +148,45 @@ expressed with a plain item. Hosting a view costs two behaviours, and both are d
   when the pointer crosses into it *during* a move and misses when the pointer arrives directly, so
   the button would show up only sometimes. `menu(_:willHighlight:)` is reliable and fires for
   arrow-key selection as well, which is exactly the "hovered or selected" behaviour wanted.
+- The selection is **not painted** by the menu, so `HistoryRowView.draw` paints it. The menu still
+  tracks the row — `menu(_:willHighlight:)` fires for it and `highlightedItem` reports it — but
+  every row of the menu's backing `NSTableViewBackedMenuRepresentation` reports
+  `isSelected == false`, so a view-based row with no drawing of its own shows no highlight at all.
+  `isHighlighted` drives both that fill and the delete button's reveal.
 
 Menus can be mutated while they are tracking: removing and re-adding items leaves the menu open
 and it re-lays out its rows. That is what lets paging and deletion redraw in place instead of
 closing and reopening the menu under the pointer.
+
+Because the rows draw their own selection, the marked row is tracked in `highlightedRow` rather
+than read back from the menu — the menu is the wrong source for it twice over. It reports `nil`
+for the row it has just highlighted (opening sends `willHighlight: row0` and then
+`willHighlight: nil`, which is the highlight the user never saw), and `menu(_:willHighlight:)`
+therefore ignores `nil` outright; a menu with nothing marked would leave the delete button and the
+arrow keys with nothing to sit on. A rebuild then re-applies that index to the new rows, and
+paging resets it to the top of the new page.
+
+The paging footer's ‹ › are the pointer's way to turn a page; the bare ← and → keys are the
+keyboard's, and they are caught by `HotkeyTap`, not by the menu. So is Return, which picks the
+marked entry — without it the only way to choose one is the pointer, because the items carry no
+action and the menu does not select a view-based row. A menu that is tracking runs its own Carbon
+event loop over these keys and nothing inside the application sees them: measured against a live
+menu, a hidden item's key equivalent never fires, `NSMenu.performKeyEquivalent(with:)` is never
+called, and a local event monitor never receives the event. The tap sits ahead of all of that, so
+`HotkeyTap.install(onUnmodifiedKey:)` hands it the modifier-free keys first and
+`HistoryPanelController.handleKey` answers whether it consumed one. Paging is refused outside
+`.paged`; Return works in both modes.
+
+Return commits `highlightedRow` rather than row 0, and rather than whatever `highlightedItem`
+says — it is the same index the drawing uses. `visibleRecords` is what makes that safe: it is the
+single list the menu's rows and `highlightedRow` are both derived from, so "the row that is
+painted" and "the row Return picks" cannot drift apart. Committing is `cancelTracking()` plus
+setting `pendingSelection`, the same two steps `mouseDown` takes.
+
+Note when verifying any of this: a synthetic key or mouse move cannot be driven into a tracking
+menu — measured, posted events never arrive, which is why the arrow-key path could not be checked
+by posting arrows. Drive `menu(_:willHighlight:)` directly instead; that is what AppKit's own
+navigation calls.
 
 The two entry points present the same records differently. ⌘⇧V is **paged** — 11 entries plus a
 footer that carries ‹ › and a page indicator, capped at 3 pages so a long history cannot become an
@@ -138,8 +209,17 @@ Three further consequences of building this out of a menu:
   spends ~12pt vertically on padding, which makes 12 rows of 24pt land on 300pt. Titles are
   truncated by binary search over grapheme clusters against a budget measured in **points** — the
   history mixes Chinese and Latin, so a character count would be wrong for both — and the budget
-  comes from `HistoryRowView.titleWidth`, which is what remains once the thumbnail and the delete
-  button are placed. Re-measure after touching any of these.
+  comes from `HistoryRowView.titleWidth`, which is what remains once the ordinal column, the
+  thumbnail and the delete button are placed. Re-measure after touching any of these.
+
+Rows lead with an ordinal, and it is the entry's position in the **whole history**, not in the
+page: page 2 starts at 12, page 3 at 23. The point of it is to be a name for an entry — "复制到第三页
+的第6个" should tell the user which entry they are looking at — and a number that restarted at 1 on
+every page would say nothing they could not get by counting rows. The column is measured from
+`records.count` rather than from the last ordinal on the page, so it keeps its width when the page
+turns and the titles do not shift sideways; the digits are monospaced for the same reason. The
+ordinal is a position, not a property of the entry: it is not stored, it changes as the history
+grows, and it is not part of what the row pastes.
 
 `ShortcutBinding` lives in `SettingsController.swift`, not its own file. The global shortcut is
 claimed by a `CGEvent` tap (`HotkeyTap`), **not** `NSEvent.addGlobalMonitorForEvents`: a global
@@ -151,7 +231,10 @@ untrusted process gets a monitor that silently delivers nothing, but a tap that 
 itself on `tapDisabledByTimeout` and rate-limits auto-repeat. Its C callback takes `keyCode`/`flags`
 rather than the `CGEvent`, because `CGEvent` is not `Sendable` under strict concurrency, and
 reaches the instance through an **unretained** refcon — so the owner must outlive the tap and call
-`remove()`. The menu item's key equivalent is hardcoded to `⌘⇧V` and does not follow a rebound
+`remove()`. It carries a second job: `onUnmodifiedKey` is consulted first for keys with no
+modifiers, which is how the history menu's paging arrows and its Return key are claimed (see the
+UI layer). The menu
+item's key equivalent is hardcoded to `⌘⇧V` and does not follow a rebound
 shortcut. Shortcut and history limit persist via `UserDefaults` (`historyShortcut` key) and the
 store respectively.
 

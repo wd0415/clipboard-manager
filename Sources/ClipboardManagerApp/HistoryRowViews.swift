@@ -2,8 +2,12 @@ import AppKit
 
 /// One history entry, drawn as a menu row.
 ///
-/// Hosting a custom view in an `NSMenuItem` gives up two behaviours a plain item provides, and
-/// both are restored here on purpose:
+/// The row leads with the entry's ordinal — its position in the whole history, so a row on the
+/// third page still says which entry it is instead of restarting at 1. The ordinal is a position,
+/// not a property of the entry: it is not stored, and it is not part of what the row pastes.
+///
+/// Hosting a custom view in an `NSMenuItem` gives up three behaviours a plain item provides, and
+/// all three are restored here on purpose:
 ///
 /// - The menu no longer performs click-to-select for the row, so `mouseDown` selects explicitly.
 /// - The delete button cannot be revealed with an `NSTrackingArea`. Measured while a menu is
@@ -11,6 +15,7 @@ import AppKit
 ///   misses when the pointer arrives directly, so the reveal would be intermittent.
 ///   `NSMenuDelegate.menu(_:willHighlight:)` is reliable and fires for arrow-key selection too,
 ///   which is exactly the "hovered or selected" behaviour asked for.
+/// - The row is not painted as selected, so `draw` paints it — see `isHighlighted`.
 @MainActor
 final class HistoryRowView: NSView {
     static let height: CGFloat = 24
@@ -18,7 +23,9 @@ final class HistoryRowView: NSView {
     private static let gap: CGFloat = 6
     private static let deleteSize: CGFloat = 16
     private static let thumbnailSize: CGFloat = 18
+    private static let cornerRadius: CGFloat = 4
 
+    private let ordinalField = NSTextField(labelWithString: "")
     private let titleField = NSTextField(labelWithString: "")
     private let thumbnailView = NSImageView()
     private let deleteButton = NSButton(title: "", target: nil, action: nil)
@@ -27,29 +34,70 @@ final class HistoryRowView: NSView {
     var onDelete: (() -> Void)?
 
     /// Set by the menu delegate when this row becomes the highlighted one.
-    var showsDelete = false {
-        didSet { deleteButton.isHidden = !showsDelete }
+    ///
+    /// The selection is drawn here rather than left to AppKit. A menu item hosting a custom view
+    /// is still tracked — `menu(_:willHighlight:)` fires for it and `NSMenu.highlightedItem`
+    /// reports it — but the row is never *painted* as selected: measured against a live menu,
+    /// every row of the backing table view reports `isSelected == false`, so the row showed no
+    /// selection at all. The delete button's reveal hangs off the same state, which is the
+    /// "hovered or selected" behaviour the row wants.
+    var isHighlighted = false {
+        didSet {
+            guard isHighlighted != oldValue else { return }
+            deleteButton.isHidden = !isHighlighted
+            deleteButton.contentTintColor = isHighlighted ? .selectedMenuItemTextColor : .secondaryLabelColor
+            titleField.textColor = isHighlighted ? .selectedMenuItemTextColor : .labelColor
+            ordinalField.textColor = isHighlighted ? .selectedMenuItemTextColor : .secondaryLabelColor
+            needsDisplay = true
+        }
     }
 
     var deleteButtonFrame: NSRect { deleteButton.frame }
 
-    /// Space left for the title once the thumbnail, the delete button and the margins are taken.
-    /// The controller needs this to truncate before handing text over, because a label clips
-    /// rather than ellipsizing.
-    static func titleWidth(hasThumbnail: Bool, totalWidth: CGFloat) -> CGFloat {
-        let leading = hasThumbnail ? padding + thumbnailSize + gap : padding
+    /// Space left for the title once the ordinal, the thumbnail, the delete button and the
+    /// margins are taken. The controller needs this to truncate before handing text over, because
+    /// a label clips rather than ellipsizing.
+    static func titleWidth(hasThumbnail: Bool, ordinalWidth: CGFloat, totalWidth: CGFloat) -> CGFloat {
+        var leading = padding + ordinalWidth + gap
+        if hasThumbnail { leading += thumbnailSize + gap }
         return totalWidth - padding - deleteSize - gap - leading
     }
 
-    init(title: String, thumbnail: NSImage?, totalWidth: CGFloat) {
+    /// The ordinal column, which the controller has to measure to reserve it.
+    ///
+    /// Digits are monospaced and the column is sized for the longest ordinal in the menu, so the
+    /// numbers line up and the column does not change width from page to page — the titles would
+    /// otherwise shift sideways every time the page turns.
+    static let ordinalFont = NSFont.monospacedDigitSystemFont(
+        ofSize: NSFont.menuFont(ofSize: 0).pointSize,
+        weight: .regular
+    )
+
+    static func ordinalWidth(forLargest ordinal: Int) -> CGFloat {
+        ("\(ordinal)" as NSString).size(withAttributes: [.font: ordinalFont]).width.rounded(.up)
+    }
+
+    init(title: String, thumbnail: NSImage?, ordinal: Int, ordinalWidth: CGFloat, totalWidth: CGFloat) {
         super.init(frame: NSRect(x: 0, y: 0, width: totalWidth, height: Self.height))
 
-        var titleOriginX = Self.padding
+        ordinalField.stringValue = "\(ordinal)"
+        ordinalField.font = Self.ordinalFont
+        ordinalField.textColor = .secondaryLabelColor
+        ordinalField.alignment = .right
+        ordinalField.frame = NSRect(
+            x: Self.padding,
+            y: (Self.height - 16) / 2,
+            width: ordinalWidth,
+            height: 16
+        )
+        addSubview(ordinalField)
+
+        var titleOriginX = ordinalField.frame.maxX + Self.gap
         if let thumbnail {
             thumbnailView.image = thumbnail
             thumbnailView.imageScaling = .scaleProportionallyUpOrDown
             thumbnailView.frame = NSRect(
-                x: Self.padding,
+                x: titleOriginX,
                 y: (Self.height - Self.thumbnailSize) / 2,
                 width: Self.thumbnailSize,
                 height: Self.thumbnailSize
@@ -87,6 +135,14 @@ final class HistoryRowView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// Paints the selection the menu does not paint for a view-based row. Filling the whole
+    /// bounds matches what the menu draws behind a plain item, whose row is exactly this wide.
+    override func draw(_ dirtyRect: NSRect) {
+        guard isHighlighted else { return }
+        NSColor.selectedContentBackgroundColor.setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: Self.cornerRadius, yRadius: Self.cornerRadius).fill()
+    }
 
     /// A row hosting a custom view is not selected by the menu itself. Clicks that land on the
     /// delete button are delivered to the button and never reach here.

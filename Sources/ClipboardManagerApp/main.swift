@@ -40,7 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.hotkeyTap = hotkeyTap
         // Installing the tap is also the honest test of the permission: an untrusted process
         // gets a global monitor that silently delivers nothing, but a tap that refuses to exist.
-        accessibilityTrusted = hotkeyTap.install { [weak self] in self?.presentHistory() }
+        accessibilityTrusted = hotkeyTap.install(
+            onHotkey: { [weak self] in self?.presentHistory() },
+            onUnmodifiedKey: { [weak self] keyCode in self?.historyPanel?.handleKey(keyCode) ?? false }
+        )
         let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ClipboardManager", isDirectory: true)
         NSLog("Clipboard Manager data path: %@", applicationSupport.path)
