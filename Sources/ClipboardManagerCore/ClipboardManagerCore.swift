@@ -35,11 +35,21 @@ public struct ClipRecord: Codable, Equatable, Identifiable, Sendable {
     public let id: UUID
     public let createdAt: Date
     public let payload: ClipPayload
+    /// Whether the entry is pinned to a section of its own at the top of the history. This is a
+    /// property of the entry rather than a position: the ordinal the menu draws is derived from
+    /// `createdAt`, and a pinned entry has deliberately left that sequence.
+    public let isPinned: Bool
 
-    public init(id: UUID = UUID(), createdAt: Date = Date(), payload: ClipPayload) {
+    public init(
+        id: UUID = UUID(),
+        createdAt: Date = Date(),
+        payload: ClipPayload,
+        isPinned: Bool = false
+    ) {
         self.id = id
         self.createdAt = createdAt
         self.payload = payload
+        self.isPinned = isPinned
     }
 
     public var displayText: String {
@@ -74,10 +84,12 @@ public final class ClipboardStore: @unchecked Sendable {
                     id TEXT PRIMARY KEY,
                     created_at REAL NOT NULL,
                     kind INTEGER NOT NULL,
-                    payload BLOB NOT NULL
+                    payload BLOB NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS clips_created_at ON clips(created_at DESC);
                 """)
+            try addPinColumnIfMissing()
         } catch {
             sqlite3_close(database)
             database = nil
@@ -147,8 +159,8 @@ public final class ClipboardStore: @unchecked Sendable {
 
     public func list(query: String? = nil) -> [ClipRecord] {
         let sql = query?.isEmpty == false
-            ? "SELECT id, created_at, kind, payload FROM clips WHERE kind = 0 AND lower(CAST(payload AS TEXT)) LIKE lower(?) ORDER BY created_at DESC"
-            : "SELECT id, created_at, kind, payload FROM clips ORDER BY created_at DESC"
+            ? "SELECT id, created_at, kind, payload, pinned FROM clips WHERE kind = 0 AND lower(CAST(payload AS TEXT)) LIKE lower(?) ORDER BY pinned DESC, created_at DESC"
+            : "SELECT id, created_at, kind, payload, pinned FROM clips ORDER BY pinned DESC, created_at DESC"
         var statement: OpaquePointer?
         guard (try? prepare(sql, &statement)) != nil else { return [] }
         defer { sqlite3_finalize(statement) }
@@ -159,6 +171,27 @@ public final class ClipboardStore: @unchecked Sendable {
             result.append(record)
         }
         return result
+    }
+
+    /// Adds the `pinned` column to a database created before pinning existed.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` does not touch a table that already exists, so an installed
+    /// database keeps the four-column shape it was created with — and `list()` answers a failed
+    /// prepare with `[]`, so reading `pinned` against one fails as an *empty history* rather than
+    /// as an error. A fresh database already has the column, so this is a no-op there; an existing
+    /// one has it appended, which leaves the physical column order the same either way.
+    ///
+    /// Probing `table_info` rather than catching "duplicate column name" keeps the correctness off
+    /// SQLite's English error strings.
+    private func addPinColumnIfMissing() throws {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try prepare("PRAGMA table_info(clips)", &statement)
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let name = sqlite3_column_text(statement, 1) else { continue }
+            if String(cString: name) == "pinned" { return }
+        }
+        try execute("ALTER TABLE clips ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
     }
 
     private func trim() throws {
@@ -188,7 +221,7 @@ public final class ClipboardStore: @unchecked Sendable {
         guard let bytes = sqlite3_column_blob(statement, 3) else { return nil }
         let data = Data(bytes: bytes, count: Int(length))
         let payload: ClipPayload = kind == 0 ? .text(String(decoding: data, as: UTF8.self)) : .image(data)
-        return ClipRecord(id: id, createdAt: date, payload: payload)
+        return ClipRecord(id: id, createdAt: date, payload: payload, isPinned: sqlite3_column_int(statement, 4) != 0)
     }
 
     private static func message(_ database: OpaquePointer?) -> String {
