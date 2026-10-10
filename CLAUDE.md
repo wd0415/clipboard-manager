@@ -110,6 +110,40 @@ scan. It is enforced by calling `trim()` at the end of every `insert`, which del
 newest N rows. It is not a background job, and nothing trims at launch: a store left over from a
 larger limit keeps its extra rows until the next copy, then falls to 50.
 
+`maxPinnedEntries` is **fixed at 5**, same shape — `let`, no setter, no UI — enforced by
+`setPinned(_:id:)` rather than by the UI, because it is a property of the store and therefore
+testable. It is **not** an `init` parameter: `maxEntries` is one because a test needs to build an
+over-cap history, and pinning a sixth entry needs only six inserts.
+
+Pinning is a **column**, `pinned INTEGER NOT NULL DEFAULT 0`, because it is a state on an entry
+rather than another kind of entry — which is also why `promote`, `delete` and `clear` keep their
+meaning unchanged. `setPinned(_:id:)` returns `PinOutcome` (`.pinned` / `.unpinned` /
+`.refusedBoardIsFull`) instead of throwing: a full pinboard is a decision to refuse and say so, not
+an I/O failure, and throwing would collapse "pinned" and "could not pin" into one `catch` so the
+UI could no longer tell them apart. It also **never drops the oldest pin** to make room — which
+entry gives up its place is the user's decision, not a side effect of this click.
+
+The column needs a migration, and it is the one path in this file that fails **without an error**:
+`CREATE TABLE IF NOT EXISTS` does not touch a table that already exists, so an installed database
+keeps its old shape — and `list()` answers a failed prepare with `[]`, so the user sees an empty
+history rather than a crash. So `init` probes `PRAGMA table_info(clips)` and appends the column
+when it is absent, rather than catching `duplicate column name` and matching SQLite's English
+error string. Note that an installed database may carry columns the current source no longer
+declares (the shipped build's table has a `synced` column that the source does not create);
+`list()` selects by name, so extra columns are harmless, and the probe matches on `pinned`
+specifically for the same reason.
+
+`trim()` now keeps the newest 50 **unpinned** rows plus every pinned one. The cap counts recent
+entries only: pinning is a decision to keep something past its moment, and letting that decision
+shorten the recent list would mean the price of pinning is paid by the entries the user did not
+pin. The ids come from the subquery itself rather than from a caller's string, so the
+case-sensitivity trap described above does not apply to it.
+
+`list()` orders by `ORDER BY pinned DESC, created_at DESC`, so one query returns both sections
+with the pinboard first; the controller splits them itself, which is what keeps the two from ever
+disagreeing about what the history holds. No index is added for it: the table tops out at 55
+rows, and `clips_created_at` is already superfluous at that size.
+
 Row ids are written as `UUID.uuidString`, which is uppercase, and `promote(id:)` / `delete(id:)`
 match on it with `=`. SQLite compares TEXT case-sensitively, so a lowercase id — say, one inserted
 by hand while fixture-building — silently matches nothing and the delete appears to do nothing.
@@ -243,22 +277,61 @@ Three further consequences of building this out of a menu:
   pasting early sends the keystroke nowhere. Its `isPasting` flag keeps `presentHistory` from
   starting a second paste while one is in flight.
 - The menu has no maximum width or height — `minimumWidth` is a floor, not a ceiling — so
-  `HistoryPanelController` holds it to 260×300pt from the content side: a row view `w` points wide
+  `HistoryPanelController` holds it to 282×348pt from the content side: a row view `w` points wide
   renders a menu exactly `w` wide (measured, so there is no added horizontal chrome), and a menu
-  spends ~12pt vertically on padding, which makes 12 rows of 24pt land on 300pt. Titles are
-  truncated by binary search over grapheme clusters against a budget measured in **points** — the
-  history mixes Chinese and Latin, so a character count would be wrong for both — and the budget
-  comes from `HistoryRowView.titleWidth`, which is what remains once the ordinal column, the
-  thumbnail and the delete button are placed. Re-measure after touching any of these.
+  spends ~12pt vertically on padding, which makes 14 rows of 24pt land on 348pt. The 22pt of extra
+  width over the previous 260 is the pin button's: at 260 a recent row's title would fall to 177pt,
+  and at 282 it keeps the 199pt it has always had, so a board of zero pins truncates exactly as it
+  did before pinning existed. Titles are truncated by binary search over grapheme clusters against a
+  budget measured in **points** — the history mixes Chinese and Latin, so a character count would be
+  wrong for both — and the budget comes from `HistoryRowView.titleWidth`, which is what remains once
+  the ordinal column, the thumbnail, the pin button and the delete button are placed. Re-measure
+  after touching any of these.
+- The per-page count is **derived** rather than stated: `maxRowsPerPage = (348 - 12) / 24 = 14`, and
+  `recordsPerPage = max(1, min(11, maxRowsPerPage - 页脚1 - 固定数))`. That `min(11, …)` is the
+  load-bearing part — up to two pins the recent rows still fit and the menu simply grows, from the
+  third they have to give, and with no pins at all the menu is byte-identical to the one that
+  shipped before this feature. Without it, raising the cap to fourteen rows would have silently
+  handed every user two extra entries per page. The pinboard is drawn above the recent rows on page
+  one and is not repeated afterwards, so what it costs the budget is paid once, and `pageCount`
+  counts recent entries only. With a full board `⌘⇧V` reaches 24 recent entries rather than 33 and
+  the rest stay reachable through 「显示历史」, which is the same reason the three-page cap was
+  never a gap.
+- Pinned rows carry **no ordinal**. The number is a position among the recent entries, and pinning is
+  precisely having left that sequence; a blank column would read as a rendering fault rather than as
+  "this one is not counted". It costs the pinned row 23pt of title it does not need — 222pt against
+  a recent row's 199pt — which is the right way round, since the pinned entries are the ones worth
+  reading. `ordinalWidth` is therefore measured from the recent count.
+- The divider rides the **first recent row** rather than the last pinned one, so "pinned but nothing
+  recent" needs no case at all: with no recent row there is nothing to carry the line. It is painted
+  in `HistoryRowView.draw` for the same reason the footer's is — a real `NSMenuItem.separator()` is an
+  item with a height of its own, and the row budget is exact — and it is painted *under* the
+  highlight, since a separator-coloured hairline drawn over the selection fill would read as a grey
+  line through the selected row.
+- The pin button rides the same reveal as the delete button (`isHighlighted.didSet` →
+  `updateAppearance()`), so the tracking-area trap that applies to a tracking menu applies here too
+  and is not worth a second workaround. A pinned row keeps it on screen at all times and shows
+  `pin.slash` rather than `pin`, because that constant mark is the whole of how the row says it is
+  pinned and clicking it is what unpins. `pin.slash` ships with SF Symbols 4.0, and the fallback to
+  `pin.fill` exists only because `NSImage(systemSymbolName:)` answers a symbol it cannot find with
+  `nil`, which renders as a button-sized blank rather than as an error.
+- The pin button has three states — hidden, shown, refusing — and the refusal has to survive a
+  highlight change landing on top of it, which is why `isHighlighted` and `isRefusingPin` both reach
+  the tint through one `updateAppearance()` instead of each keeping its own copy of "what colour is
+  everything". A refusal shows as 0.6s of red (`pinRefusalSeconds`), not as an alert and not as
+  dropping the oldest pin: it answers one deliberate, infrequent click, and what it reports — one
+  board of five being full — is smaller than the window an alert would put on screen to say it. It is
+  also not the capture feedback `todo.md` rules out; that one is ambient, on every copy.
 
 Rows lead with an ordinal, and it is the entry's position in the **whole history**, not in the
 page: page 2 starts at 12, page 3 at 23. The point of it is to be a name for an entry — "复制到第三页
 的第6个" should tell the user which entry they are looking at — and a number that restarted at 1 on
-every page would say nothing they could not get by counting rows. The column is measured from
-`records.count` rather than from the last ordinal on the page, so it keeps its width when the page
+every page would say nothing they could not get by counting rows. The column is measured from the
+recent count rather than from the last ordinal on the page, so it keeps its width when the page
 turns and the titles do not shift sideways; the digits are monospaced for the same reason. The
 ordinal is a position, not a property of the entry: it is not stored, it changes as the history
-grows, and it is not part of what the row pastes.
+grows, and it is not part of what the row pastes. A pinned row has none at all, for the reason
+given above.
 
 `ShortcutBinding` lives in `SettingsController.swift`, not its own file. The global shortcut is
 claimed by a `CGEvent` tap (`HotkeyTap`), **not** `NSEvent.addGlobalMonitorForEvents`: a global
