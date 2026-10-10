@@ -68,6 +68,11 @@ public final class ClipboardStore: @unchecked Sendable {
     /// the last few copies reachable, and a limit the user can raise only makes the list longer to
     /// search by eye. Enforced by `trim()` at the end of every `insert`.
     public let maxEntries: Int
+    /// How many entries may be pinned at once. Fixed rather than adjustable for the same reason
+    /// `maxEntries` is: the pinboard is the handful of entries always worth reaching, and a board
+    /// that grows without bound stops being one. Enforced here rather than in the UI so that it is
+    /// a property of the store and can be tested.
+    public let maxPinnedEntries: Int = 5
 
     public init(directory: URL, maxEntries: Int = 50) throws {
         guard maxEntries > 0 else { throw StoreError.invalidLimit }
@@ -140,6 +145,36 @@ public final class ClipboardStore: @unchecked Sendable {
         guard sqlite3_step(statement) == SQLITE_DONE else { throw StoreError.database(Self.message(database)) }
     }
 
+    /// Pins or unpins an entry, exempting it from the entry cap while it is pinned.
+    ///
+    /// Refuses rather than throwing when the board is full, and never drops an existing pin to
+    /// make room: which entry loses its place is the user's decision, not a side effect of pinning
+    /// something else.
+    @discardableResult
+    public func setPinned(_ pinned: Bool, id: UUID) throws -> PinOutcome {
+        if pinned, try pinnedCount(excluding: id) >= maxPinnedEntries {
+            return .refusedBoardIsFull
+        }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try prepare("UPDATE clips SET pinned = ? WHERE id = ?", &statement)
+        sqlite3_bind_int(statement, 1, pinned ? 1 : 0)
+        sqlite3_bind_text(statement, 2, id.uuidString, -1, sqliteTransient)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw StoreError.database(Self.message(database)) }
+        return pinned ? .pinned : .unpinned
+    }
+
+    /// Counts the pinned entries other than `id`, so that pinning something already pinned is not
+    /// treated as a second entry's worth of demand on a full board.
+    private func pinnedCount(excluding id: UUID) throws -> Int {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try prepare("SELECT COUNT(*) FROM clips WHERE pinned = 1 AND id <> ?", &statement)
+        sqlite3_bind_text(statement, 1, id.uuidString, -1, sqliteTransient)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int(statement, 0))
+    }
+
     /// Removes one entry.
     ///
     /// Unlike `clear()` this is not confirmed: it is reached from the delete button on a single
@@ -194,8 +229,15 @@ public final class ClipboardStore: @unchecked Sendable {
         try execute("ALTER TABLE clips ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
     }
 
+    /// Keeps the newest `maxEntries` unpinned rows plus every pinned one.
+    ///
+    /// The cap counts recent entries only: pinning is a decision to keep something past its
+    /// moment, and letting that decision shorten the recent list would mean the price of pinning
+    /// is paid by the entries the user did not pin. The ids come from the subquery itself rather
+    /// than from a caller's string, so the case-sensitivity trap around `UUID.uuidString` — which
+    /// this codebase has been bitten by — does not apply here.
     private func trim() throws {
-        try execute("DELETE FROM clips WHERE id NOT IN (SELECT id FROM clips ORDER BY created_at DESC LIMIT \(maxEntries))")
+        try execute("DELETE FROM clips WHERE pinned = 0 AND id NOT IN (SELECT id FROM clips WHERE pinned = 0 ORDER BY created_at DESC LIMIT \(maxEntries))")
     }
 
     private func execute(_ sql: String) throws {
@@ -228,6 +270,15 @@ public final class ClipboardStore: @unchecked Sendable {
         guard let database, let message = sqlite3_errmsg(database) else { return "Unknown SQLite error" }
         return String(cString: message)
     }
+}
+
+/// What `setPinned` did. A full pinboard is a refusal rather than a failure, because the caller is
+/// expected to show it and carry on — throwing would collapse "pinned" and "could not pin" into
+/// one `catch`, and the UI could then no longer tell the user which happened.
+public enum PinOutcome: Equatable, Sendable {
+    case pinned
+    case unpinned
+    case refusedBoardIsFull
 }
 
 public enum StoreError: Error, Equatable {

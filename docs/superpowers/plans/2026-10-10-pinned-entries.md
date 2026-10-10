@@ -285,7 +285,8 @@ instead of an error."
     let oldest = try store.insert(.text("oldest"))
     _ = try store.insert(.text("second"))
     _ = try store.setPinned(true, id: oldest.id)
-    #expect(store.list().map(\.displayText) == ["second", "oldest"])
+    // Pinning leads the list even though it is the older of the two.
+    #expect(store.list().map(\.displayText) == ["oldest", "second"])
 
     _ = try store.setPinned(false, id: oldest.id)
     _ = try store.insert(.text("third"))    // the trim that now reaches it
