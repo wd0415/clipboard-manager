@@ -9,7 +9,7 @@ import ClipboardManagerCore
 /// `NSMenu` sizes itself to its widest and tallest content and exposes no maximum for either
 /// (`minimumWidth` is a floor, not a ceiling). The bounds below are therefore enforced by sizing
 /// the row views and by handing the menu no more rows than fit — never by setting a size on the
-/// menu. Both constants are measured, not estimated: a row view 260pt wide renders a 260pt menu
+/// menu. Both constants are measured, not estimated: a row view 282pt wide renders a 282pt menu
 /// with no added chrome, and a menu spends ~12pt vertically on padding.
 @MainActor
 final class HistoryPanelController: NSObject, NSMenuDelegate {
@@ -21,14 +21,20 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
         case scrolling
     }
 
-    /// Widest the menu may render.
-    private let maxMenuWidth: CGFloat = 260
-    /// Tallest the menu may render.
-    private let maxMenuHeight: CGFloat = 300
+    /// Widest the menu may render. 282 rather than 260 because the pin button takes 22pt out of
+    /// the row: at 260 the title would shrink to 177pt, and at 282 it keeps the 199pt it has
+    /// always had, so a board of zero pins truncates exactly as it did before pinning existed.
+    private let maxMenuWidth: CGFloat = 282
+    /// Tallest the menu may render. 348pt is fourteen 24pt rows, which is what a full pinboard
+    /// above a full first page adds up to.
+    private let maxMenuHeight: CGFloat = 348
     /// Vertical space the menu spends on padding, measured from a rendered menu.
     private let menuChromeHeight: CGFloat = 12
-    /// Entries per page. Twelve rows fit the height cap; one of them is the paging footer.
-    private let recordsPerPage = 11
+    /// Rows the height cap buys once the chrome is subtracted. Stated rather than divided at each
+    /// use so that raising the cap cannot leave the budget and the per-page count disagreeing.
+    private var maxRowsPerPage: Int {
+        Int((maxMenuHeight - menuChromeHeight) / HistoryRowView.height)
+    }
     /// Ceiling on pages, so a long history cannot turn the pop-up into an endless pager. Entries
     /// past the last page stay reachable through `Mode.scrolling`.
     private let maxPages = 3
@@ -55,7 +61,10 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
     static let keypadEnterKeyCode: UInt16 = 76
 
     private let store: ClipboardStore
-    private var records: [ClipRecord] = []
+    /// The two sections, refreshed together from a single `list()` call so they can never disagree
+    /// about what the history holds.
+    private var pinnedRecords: [ClipRecord] = []
+    private var recentRecords: [ClipRecord] = []
     private var pendingSelection: ClipRecord?
     private var mode: Mode = .paged
     private var page = 0
@@ -73,6 +82,13 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
         self.store = store
     }
 
+    /// Re-reads the whole history and splits it into the two sections the menu draws.
+    private func loadRecords() {
+        let stored = store.list()
+        pinnedRecords = stored.filter(\.isPinned)
+        recentRecords = stored.filter { !$0.isPinned }
+    }
+
     /// Builds the history menu and tracks it until dismissed, returning the chosen entry.
     ///
     /// `popUp` runs a nested event loop, so this returns only after the menu has closed. The
@@ -86,7 +102,7 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
         pendingSelection = nil
         page = 0
         highlightedRow = 0
-        records = store.list()
+        loadRecords()
 
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -104,7 +120,7 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
     }
 
     private var pageCount: Int {
-        min(maxPages, max(1, (records.count + recordsPerPage - 1) / recordsPerPage))
+        min(maxPages, max(1, (recentRecords.count + recordsPerPage - 1) / recordsPerPage))
     }
 
     /// Clamped, because deleting entries can leave the stored page past the last one.
@@ -112,33 +128,54 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
         min(page, pageCount - 1)
     }
 
-    /// Where the menu's first row sits in the whole history.
+    /// How many recent rows a page carries.
+    ///
+    /// The pinboard is drawn above them on page one and is not repeated on later pages, so the
+    /// budget it costs is paid once. Up to two pins the recent rows still fit and the menu simply
+    /// grows; from the third they have to give. `min(11, …)` is what makes a board of zero pins
+    /// byte-identical to the menu that shipped before pinning — without it, raising the cap to
+    /// fourteen rows would silently hand every user two extra entries per page.
+    private var recordsPerPage: Int {
+        guard mode == .paged else { return max(1, recentRecords.count) }
+        return max(1, min(11, maxRowsPerPage - 1 - pinnedRecords.count))
+    }
+
+    /// Where the menu's first recent row sits in the whole history.
     ///
     /// This is what the rows are numbered from, and it is deliberately not 1 on every page: the
     /// ordinal is the entry's position in the history, so page 2 starts at 12. A per-page number
     /// would tell the user nothing they cannot already see by counting rows.
     private var visibleStart: Int {
-        switch mode {
-        case .scrolling: return 0
-        case .paged: return currentPage * recordsPerPage
-        }
+        mode == .scrolling ? 0 : currentPage * recordsPerPage
     }
 
-    /// The records the current mode actually puts in the menu, in the order it puts them there.
-    ///
-    /// `highlightedRow` is an index into this, so the two have to be derived the same way — that
-    /// is what makes "commit the highlighted row" and "draw the highlighted row" agree. The ordinal
-    /// of a row is its index here plus `visibleStart` plus one.
-    private var visibleRecords: [ClipRecord] {
+    /// The pinboard, which belongs to the first page only — from page two on, the menu is the
+    /// recent sequence and nothing else.
+    private var visiblePinned: [ClipRecord] {
+        mode == .paged && currentPage == 0 ? pinnedRecords : []
+    }
+
+    private var visibleRecentEntries: [ClipRecord] {
         let start = visibleStart
-        let end = mode == .paged ? min(start + recordsPerPage, records.count) : records.count
-        return Array(records[start..<end])
+        guard start < recentRecords.count else { return [] }
+        let end = mode == .scrolling ? recentRecords.count : min(start + recordsPerPage, recentRecords.count)
+        return Array(recentRecords[start..<end])
+    }
+
+    /// The records the current mode actually puts in the menu, in the order it puts them there,
+    /// pinned first.
+    ///
+    /// This is the single list the menu's rows and `highlightedRow` are both derived from, so that
+    /// is what makes "commit the highlighted row" and "draw the highlighted row" agree.
+    private var visibleRecords: [ClipRecord] {
+        visiblePinned + visibleRecentEntries
     }
 
     /// Width of the ordinal column, measured against the longest ordinal the menu can show rather
     /// than the one this page happens to end on, so the column does not resize when the page turns.
+    /// Measured against the recent count, because a pinned row carries no number.
     private var ordinalWidth: CGFloat {
-        HistoryRowView.ordinalWidth(forLargest: max(records.count, 1))
+        HistoryRowView.ordinalWidth(forLargest: max(recentRecords.count, 1))
     }
 
     /// Rebuilds the menu's rows in place.
@@ -149,7 +186,7 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
     private func rebuild(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        guard !records.isEmpty else {
+        guard !pinnedRecords.isEmpty || !recentRecords.isEmpty else {
             let empty = NSMenuItem(title: "还没有剪贴板历史", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
@@ -168,10 +205,18 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
             return
         }
 
-        // Both modes put the same rows in the menu; only the footer is paged-only. Which records
-        // those are is `visibleRecords`' decision, and it is the same list `highlightedRow` indexes.
+        // Both modes put the same two sections in the menu; only the footer is paged-only. Which
+        // records those are is `visibleRecords`' decision, and it is the same list
+        // `highlightedRow` indexes.
+        let pinned = visiblePinned
         for (offset, record) in visibleRecords.enumerated() {
-            menu.addItem(makeItem(for: record, ordinal: visibleStart + offset + 1))
+            menu.addItem(makeItem(
+                for: record,
+                ordinal: ordinal(for: record, at: offset),
+                // The hairline rides the first recent row rather than the last pinned one, so a
+                // pinboard with nothing recent under it draws no line without needing a case.
+                drawsDivider: offset == pinned.count && !pinned.isEmpty
+            ))
         }
         if mode == .paged { menu.addItem(makeFooter()) }
 
@@ -235,7 +280,14 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
         return true
     }
 
-    private func makeItem(for record: ClipRecord, ordinal: Int) -> NSMenuItem {
+    /// The row's number in the recent sequence. A pinned entry has none: the number is a position
+    /// among the recent entries, and pinning is precisely having left that sequence.
+    private func ordinal(for record: ClipRecord, at offset: Int) -> Int? {
+        guard !record.isPinned else { return nil }
+        return visibleStart + (offset - visiblePinned.count) + 1
+    }
+
+    private func makeItem(for record: ClipRecord, ordinal: Int?, drawsDivider: Bool) -> NSMenuItem {
         let thumbnail: NSImage?
         if case .image(let data) = record.payload {
             thumbnail = NSImage(data: data)
@@ -244,20 +296,23 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
         }
 
         let row = HistoryRowView(
-            title: title(for: record),
+            title: title(for: record, ordinal: ordinal),
             thumbnail: thumbnail,
             ordinal: ordinal,
+            isPinned: record.isPinned,
             ordinalWidth: ordinalWidth,
             totalWidth: maxMenuWidth
         )
+        row.drawsDivider = drawsDivider
         row.onSelect = { [weak self] in
             guard let self else { return }
             self.pendingSelection = record
             self.activeMenu?.cancelTracking()
         }
         row.onDelete = { [weak self] in self?.delete(record) }
+        row.onTogglePin = { [weak self] in self?.togglePin(record) }
 
-        let item = NSMenuItem(title: title(for: record), action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: title(for: record, ordinal: ordinal), action: nil, keyEquivalent: "")
         item.view = row
         item.representedObject = record.id.uuidString
         return item
@@ -292,11 +347,43 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
             NSLog("Clipboard history delete failed: %@", String(describing: error))
             return
         }
-        records.removeAll { $0.id == record.id }
+        loadRecords()
         if let activeMenu { rebuild(activeMenu) }
     }
 
-    private func title(for record: ClipRecord) -> String {
+    /// Pins or unpins an entry, then redraws.
+    ///
+    /// A full pinboard is answered by the row flashing its own pin button red. Not an alert, and
+    /// not dropping the oldest pinned entry to make room: which entry gives up its place is the
+    /// user's decision, not a side effect of this click.
+    private func togglePin(_ record: ClipRecord) {
+        let outcome: PinOutcome
+        do {
+            outcome = try store.setPinned(!record.isPinned, id: record.id)
+        } catch {
+            // An I/O failure leaves the menu exactly as it was, which is also the state a user who
+            // saw nothing happen can retry from.
+            NSLog("Clipboard history pin failed: %@", String(describing: error))
+            return
+        }
+        if outcome == .refusedBoardIsFull {
+            rowView(for: record.id, in: activeMenu)?.refusePin()
+            return
+        }
+        loadRecords()
+        if let activeMenu { rebuild(activeMenu) }
+    }
+
+    /// Finds a row by the id `makeItem` tagged it with.
+    ///
+    /// `representedObject` is the right source here even though it is the wrong one for the
+    /// highlight: this is an identity written here and read back unchanged, with no second copy
+    /// of it for the menu to report instead.
+    private func rowView(for id: UUID, in menu: NSMenu?) -> HistoryRowView? {
+        menu?.items.first { $0.representedObject as? String == id.uuidString }?.view as? HistoryRowView
+    }
+
+    private func title(for record: ClipRecord, ordinal: Int?) -> String {
         let raw: String
         let hasThumbnail: Bool
         switch record.payload {
@@ -309,6 +396,7 @@ final class HistoryPanelController: NSObject, NSMenuDelegate {
         }
         let budget = HistoryRowView.titleWidth(
             hasThumbnail: hasThumbnail,
+            showsOrdinal: ordinal != nil,
             ordinalWidth: ordinalWidth,
             totalWidth: maxMenuWidth
         )

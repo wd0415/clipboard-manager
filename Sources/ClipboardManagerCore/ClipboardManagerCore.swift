@@ -35,11 +35,21 @@ public struct ClipRecord: Codable, Equatable, Identifiable, Sendable {
     public let id: UUID
     public let createdAt: Date
     public let payload: ClipPayload
+    /// Whether the entry is pinned to a section of its own at the top of the history. This is a
+    /// property of the entry rather than a position: the ordinal the menu draws is derived from
+    /// `createdAt`, and a pinned entry has deliberately left that sequence.
+    public let isPinned: Bool
 
-    public init(id: UUID = UUID(), createdAt: Date = Date(), payload: ClipPayload) {
+    public init(
+        id: UUID = UUID(),
+        createdAt: Date = Date(),
+        payload: ClipPayload,
+        isPinned: Bool = false
+    ) {
         self.id = id
         self.createdAt = createdAt
         self.payload = payload
+        self.isPinned = isPinned
     }
 
     public var displayText: String {
@@ -58,6 +68,11 @@ public final class ClipboardStore: @unchecked Sendable {
     /// the last few copies reachable, and a limit the user can raise only makes the list longer to
     /// search by eye. Enforced by `trim()` at the end of every `insert`.
     public let maxEntries: Int
+    /// How many entries may be pinned at once. Fixed rather than adjustable for the same reason
+    /// `maxEntries` is: the pinboard is the handful of entries always worth reaching, and a board
+    /// that grows without bound stops being one. Enforced here rather than in the UI so that it is
+    /// a property of the store and can be tested.
+    public let maxPinnedEntries: Int = 5
 
     public init(directory: URL, maxEntries: Int = 50) throws {
         guard maxEntries > 0 else { throw StoreError.invalidLimit }
@@ -74,10 +89,12 @@ public final class ClipboardStore: @unchecked Sendable {
                     id TEXT PRIMARY KEY,
                     created_at REAL NOT NULL,
                     kind INTEGER NOT NULL,
-                    payload BLOB NOT NULL
+                    payload BLOB NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS clips_created_at ON clips(created_at DESC);
                 """)
+            try addPinColumnIfMissing()
         } catch {
             sqlite3_close(database)
             database = nil
@@ -128,6 +145,36 @@ public final class ClipboardStore: @unchecked Sendable {
         guard sqlite3_step(statement) == SQLITE_DONE else { throw StoreError.database(Self.message(database)) }
     }
 
+    /// Pins or unpins an entry, exempting it from the entry cap while it is pinned.
+    ///
+    /// Refuses rather than throwing when the board is full, and never drops an existing pin to
+    /// make room: which entry loses its place is the user's decision, not a side effect of pinning
+    /// something else.
+    @discardableResult
+    public func setPinned(_ pinned: Bool, id: UUID) throws -> PinOutcome {
+        if pinned, try pinnedCount(excluding: id) >= maxPinnedEntries {
+            return .refusedBoardIsFull
+        }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try prepare("UPDATE clips SET pinned = ? WHERE id = ?", &statement)
+        sqlite3_bind_int(statement, 1, pinned ? 1 : 0)
+        sqlite3_bind_text(statement, 2, id.uuidString, -1, sqliteTransient)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw StoreError.database(Self.message(database)) }
+        return pinned ? .pinned : .unpinned
+    }
+
+    /// Counts the pinned entries other than `id`, so that pinning something already pinned is not
+    /// treated as a second entry's worth of demand on a full board.
+    private func pinnedCount(excluding id: UUID) throws -> Int {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try prepare("SELECT COUNT(*) FROM clips WHERE pinned = 1 AND id <> ?", &statement)
+        sqlite3_bind_text(statement, 1, id.uuidString, -1, sqliteTransient)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int(statement, 0))
+    }
+
     /// Removes one entry.
     ///
     /// Unlike `clear()` this is not confirmed: it is reached from the delete button on a single
@@ -147,8 +194,8 @@ public final class ClipboardStore: @unchecked Sendable {
 
     public func list(query: String? = nil) -> [ClipRecord] {
         let sql = query?.isEmpty == false
-            ? "SELECT id, created_at, kind, payload FROM clips WHERE kind = 0 AND lower(CAST(payload AS TEXT)) LIKE lower(?) ORDER BY created_at DESC"
-            : "SELECT id, created_at, kind, payload FROM clips ORDER BY created_at DESC"
+            ? "SELECT id, created_at, kind, payload, pinned FROM clips WHERE kind = 0 AND lower(CAST(payload AS TEXT)) LIKE lower(?) ORDER BY pinned DESC, created_at DESC"
+            : "SELECT id, created_at, kind, payload, pinned FROM clips ORDER BY pinned DESC, created_at DESC"
         var statement: OpaquePointer?
         guard (try? prepare(sql, &statement)) != nil else { return [] }
         defer { sqlite3_finalize(statement) }
@@ -161,8 +208,36 @@ public final class ClipboardStore: @unchecked Sendable {
         return result
     }
 
+    /// Adds the `pinned` column to a database created before pinning existed.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` does not touch a table that already exists, so an installed
+    /// database keeps the four-column shape it was created with — and `list()` answers a failed
+    /// prepare with `[]`, so reading `pinned` against one fails as an *empty history* rather than
+    /// as an error. A fresh database already has the column, so this is a no-op there; an existing
+    /// one has it appended, which leaves the physical column order the same either way.
+    ///
+    /// Probing `table_info` rather than catching "duplicate column name" keeps the correctness off
+    /// SQLite's English error strings.
+    private func addPinColumnIfMissing() throws {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        try prepare("PRAGMA table_info(clips)", &statement)
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let name = sqlite3_column_text(statement, 1) else { continue }
+            if String(cString: name) == "pinned" { return }
+        }
+        try execute("ALTER TABLE clips ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+    }
+
+    /// Keeps the newest `maxEntries` unpinned rows plus every pinned one.
+    ///
+    /// The cap counts recent entries only: pinning is a decision to keep something past its
+    /// moment, and letting that decision shorten the recent list would mean the price of pinning
+    /// is paid by the entries the user did not pin. The ids come from the subquery itself rather
+    /// than from a caller's string, so the case-sensitivity trap around `UUID.uuidString` — which
+    /// this codebase has been bitten by — does not apply here.
     private func trim() throws {
-        try execute("DELETE FROM clips WHERE id NOT IN (SELECT id FROM clips ORDER BY created_at DESC LIMIT \(maxEntries))")
+        try execute("DELETE FROM clips WHERE pinned = 0 AND id NOT IN (SELECT id FROM clips WHERE pinned = 0 ORDER BY created_at DESC LIMIT \(maxEntries))")
     }
 
     private func execute(_ sql: String) throws {
@@ -188,13 +263,22 @@ public final class ClipboardStore: @unchecked Sendable {
         guard let bytes = sqlite3_column_blob(statement, 3) else { return nil }
         let data = Data(bytes: bytes, count: Int(length))
         let payload: ClipPayload = kind == 0 ? .text(String(decoding: data, as: UTF8.self)) : .image(data)
-        return ClipRecord(id: id, createdAt: date, payload: payload)
+        return ClipRecord(id: id, createdAt: date, payload: payload, isPinned: sqlite3_column_int(statement, 4) != 0)
     }
 
     private static func message(_ database: OpaquePointer?) -> String {
         guard let database, let message = sqlite3_errmsg(database) else { return "Unknown SQLite error" }
         return String(cString: message)
     }
+}
+
+/// What `setPinned` did. A full pinboard is a refusal rather than a failure, because the caller is
+/// expected to show it and carry on — throwing would collapse "pinned" and "could not pin" into
+/// one `catch`, and the UI could then no longer tell the user which happened.
+public enum PinOutcome: Equatable, Sendable {
+    case pinned
+    case unpinned
+    case refusedBoardIsFull
 }
 
 public enum StoreError: Error, Equatable {
